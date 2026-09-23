@@ -4,3 +4,6 @@ output
 filename_1.pickle
 filename_2.pickle
 
+
+# NDWI input images
+ndwi/*.tif
