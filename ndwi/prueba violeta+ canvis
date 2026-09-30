@@ -1,3 +1,5 @@
+```python
+
 from pystac_client import Client
 import geopandas as gpd
 import json
@@ -192,3 +194,6 @@ if __name__ == "__main__":
     parser.add_argument("--catalog", type=str, default="element84", choices=["copernicus", "element84"], help="STAC catalog to use")
     args = parser.parse_args()
     search_catalog(args.catalog)
+
+
+```
