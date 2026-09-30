@@ -1,0 +1,194 @@
+from pystac_client import Client
+import geopandas as gpd
+import json
+import pprint
+import os
+import rasterio 
+from rasterio.mask import mask
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Definim els prints per pantalla
+pp = pprint.PrettyPrinter(indent=4)
+#---------------------
+#   NDWI
+#---------------------
+#Creem la funció per calcular el ndwi
+def calculate_ndwi(green, nir):
+    green = green.astype(float)
+    nir = nir.astype(float)
+
+    denominator = green + nir
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ndwi = (green - nir) / denominator #formula del ndwi    
+
+    ndwi[denominator == 0] = np.nan
+
+    return ndwi
+# Creem la funció que ens definirà el url segons el catàleg que desitjem
+def search_catalog(catalog):
+
+    # Sel·leccionar el cataleg STAC des de la execució a la terminal
+    if catalog == "copernicus":
+        catalog_url = "https://stac.dataspace.copernicus.eu/v1"
+    elif catalog == "element84":
+        catalog_url = "https://earth-search.aws.element84.com/v1"
+    else:
+        raise ValueError("Invalid catalog name. Choose 'copernicus' or 'element84'.")
+
+    # Directori del script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Llegir AOI Castelldefels:
+    geojson_path = os.path.join(script_dir, "polygon.geojson")
+
+    gdf = gpd.read_file(geojson_path).to_crs(epsg=4326)
+    #Geometria AOI
+    aoi = gdf.geometry.iloc[0].__geo_interface__ #AOI, no necessariament un rectangle
+
+    #Adreça fitxer configuració imatges
+    config_path = os.path.join(script_dir,"config.json")
+    config = json.load(open(config_path))
+
+    #PROVAAAAA---------------------------------------
+    print("CONFIG:", config)
+    print("CONFIG PATH:", config_path)
+
+
+    # Connecta al catàleg
+    catalog = Client.open(catalog_url)
+
+    search = catalog.search(
+        collections=f"{config['SATELLITE']['COLLECTION']}",
+        intersects=aoi,
+        datetime=f"{config['DATES']['START']}/{config['DATES']['END']}",
+        query={"eo:cloud_cover": { "lt": config["SATELLITE"]["MAX_CLOUD_COVER"]}}
+    )
+
+    #Llista d'items
+    items = list(search.items())
+    pp.pprint(items[0].assets.keys())
+    pp.pprint(f"{len(items)} items trobats")
+
+    #Llistat de bandes
+    bands = {
+    'red': 'red',
+    'green': 'green',
+    'blue': 'blue',
+    'nir': 'nir'
+}
+
+    pp.pprint("\nSelected bands:")
+
+    #Directori de sortida
+    output_dir = os.path.join(script_dir,"data")
+    os.makedirs(output_dir, exist_ok=True)# Intenta de crear la carpeta, si ja existeix no envia error
+
+    #Creem una matriu 4x8 per visualitzar el ndwi
+    fig, axes = plt.subplots(4, 8, figsize=(20, 10), constrained_layout=True)
+    axes = axes.flatten()
+    # Descarrega tif per tif i comprova les bandes
+    for item in items:
+
+        print() # Fa un salt de línia per separar cada item descarregat
+        pp.pprint(f"Item: {item.id}")
+        pp.pprint(f"Data: {item.datetime}") # Mostra la data de l'item/imatge
+        pp.pprint(f"Núvols: {item.properties.get('eo:cloud_cover')}%") # Mostra el % de núvols
+
+        cloud_cover = item.properties.get('eo:cloud_cover', 0)
+        max_cloud_cover = config["SATELLITE"]["MAX_CLOUD_COVER"]
+
+        if cloud_cover >= max_cloud_cover: # En el hipotètic cas que el filtratge no hagués funcionat
+            pp.pprint(f"WARNING: Imatge descartada perquè té {cloud_cover}% de núvols.")
+            continue # Descartem la imatge si té més núvols que el màxim permès, i passem a la següent imatge
+        else:
+            pp.pprint("OK: La imatge compleix el filtre de núvols.")
+
+        item_dir = os.path.join(output_dir, item.id) # Guarda el directori on anirà l'item
+        os.makedirs(item_dir, exist_ok=True) # Crea la adreça si no existeix ja
+
+        #Comprovar i descarregar cada banda
+        for band, asset_name in bands.items(): 
+            if asset_name not in item.assets:
+                pp.pprint(f" {band}: NOT FOUND") 
+                continue
+
+            asset = item.assets[asset_name] 
+            
+            pp.pprint(f" {band}: {asset.href}")
+
+            #Nom fitxer de sortida
+            output_path = os.path.join(item_dir, f"{band}.tif")
+
+            #Obre raster original
+            with rasterio.open(asset.href) as src:
+                #Projecta AOI al crs del raster
+                aoi_raster_crs = gdf.to_crs(src.crs)
+                #Obté geometria
+                geometry = [aoi_raster_crs.geometry.iloc[0].__geo_interface__]
+                #Retalla raster
+                data, transform = mask( src, geometry, crop=True ) #retallar raster(quadricula amb dades(pixels))
+
+                #Copia perfil original
+                profile = src.profile.copy()
+
+                #Actualitza info raster
+                profile.update(
+                    driver="GTiff", # Tipus de fitxer
+                    height=data.shape[1], # numero files
+                    width=data.shape[2], # numero columnes
+                    transform=transform,
+                    crs=src.crs
+                )# tipus de fitxer
+            
+            #Guarda
+            with rasterio.open( output_path, "w", **profile ) as dst:
+                dst.write(data) 
+            
+            pp.pprint(f" guardat: {output_path}") 
+        # Calcular NDWI
+        green_path = os.path.join(item_dir, "green.tif")
+        nir_path = os.path.join(item_dir, "nir.tif")
+        ndwi_path = os.path.join(item_dir, "ndwi.tif")
+
+        with rasterio.open(green_path) as green_src:
+            green = green_src.read(1)
+            ndwi_profile = green_src.profile.copy()
+
+        with rasterio.open(nir_path) as nir_src:
+            nir = nir_src.read(1)
+
+        ndwi = calculate_ndwi(green, nir)
+        
+        # Afegir NDWI a la graella
+        ax = axes[items.index(item)]
+        im = ax.imshow(ndwi, cmap="RdYlBu", aspect="auto")
+        ax.set_title(item.id, fontsize=7)
+        ax.axis("off")
+
+        ndwi_profile.update(
+            dtype="float32",
+            count=1
+        )
+
+        with rasterio.open(ndwi_path, "w", **ndwi_profile) as dst:
+            dst.write(ndwi.astype("float32"), 1)
+        
+
+        pp.pprint(f" NDWI guardat: {ndwi_path}")
+
+      
+        pp.pprint(f"\nDades guardades a: {output_dir}")
+
+    #Mostrar ndwi
+
+    fig.colorbar(im, ax=axes, label="NDWI")
+    plt.show()
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="STAC Catalog Demo")
+    parser.add_argument("--catalog", type=str, default="element84", choices=["copernicus", "element84"], help="STAC catalog to use")
+    args = parser.parse_args()
+    search_catalog(args.catalog)
